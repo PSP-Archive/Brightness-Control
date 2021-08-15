@@ -29,10 +29,12 @@
 #include <string.h>
 #include <psprtc.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "sysconhk.h"
 #include "blit.h"
 #include "minIni.h"
+#include "utils.h"
 
 #define KERNEL_MODE 0x1000
 #define HIGH_PRIORITY_THREAD 0x18
@@ -44,14 +46,12 @@
 #define BRIGHTNESS_DOWN 0
 #define BRIGHTNESS_NONE 2
 
-
 #define DISPLAY_MAX_TICK 200 	//Value for a timer used to display the brightness
 #define DEFAUT_DISPLAY_FGCOLOR 0xFFFFFF  //Foregorund color is pure white
-#define DEFAUT_DISPLAY_BGCOLOR 0x000000  //Background color is pure black
+#define DEFAUT_DISPLAY_BGCOLOR 0x808080  //Background color is pure black
 
-#define BRIGHTNESS_MESSAGE " BIGHTNESS %i "
+#define BRIGHTNESS_MESSAGE " Brightness %i "
 #define BRIGHTNESS_CONFIG_FILE "brightness.bin"
-#define BRIGHTNESS_EXTRA_LIVEL 30
 
 #define INI_CONFIG_FILE "brightness.ini"
 
@@ -64,13 +64,22 @@
 #define SCREEN_ON  1
 #define SCREEN_OFF 2
 
-// #define DEBUG
-#ifdef DEBUG
+#define PATCH_BRIGHTNESS
+
+#ifdef PATCH_BRIGHTNESS
+	void (* _sceDisplaySetBrightness)(int brightness, int unk1) = NULL;
 #endif
 
-PSP_MODULE_INFO("Brightness", KERNEL_MODE, 1, 3);
+// #define DEBUG
+#ifdef DEBUG
+char debug_msg[128];
+int debug_int = 0;
+#endif
+
+PSP_MODULE_INFO("Brightness", KERNEL_MODE, 1, 5);
 PSP_MAIN_THREAD_ATTR(0);
 
+//Prototypes
 int sceDisplayEnable(void);
 int sceDisplayDisable(void);
 
@@ -82,10 +91,16 @@ typedef struct _ConfigINI
 		int ButtonRT;
 		int ButtonLT;
 		int LockControls;
+		int StartupMSG;
 		int DisplayMSG;
 		int DisplayFGCOLOR;
 		int DisplayBGCOLOR;
 		char DisplayString[128];
+		int Livel1;
+		int Livel2;
+		int Livel3;
+		int Livel4;
+		int Livel5;
 } ConfigINI;
 
 typedef struct _Config
@@ -113,7 +128,8 @@ static u32 sysconPrevButtons, sysconNewButtons;
 static int screenState = SCREEN_ON;
 static int sysconUnPressedScreen = 0;
 static int lastSavedBrightness = -1;
-static int brightnessLivel[4];
+static int imposeLivel[4];
+static int brightnessLivel[5];
 static ConfigINI configINI;
 static Config config;
 static char configPath[128];
@@ -127,10 +143,23 @@ void loadINI(void)
 	configINI.ButtonRT = ini_getlhex("brightness", "ButtonRT", DEFAUT_KEY_BUTTON_RT, iniPath);
 	configINI.ButtonLT = ini_getlhex("brightness", "ButtonLT", DEFAUT_KEY_BUTTON_LT, iniPath);
 	configINI.LockControls = ini_getlhex("brightness", "LockControls", 0, iniPath);
+	configINI.StartupMSG = ini_getlhex("brightness", "StartupMSG", 1, iniPath);
 	configINI.DisplayMSG = ini_getlhex("brightness", "DisplayMSG", 1, iniPath);
 	configINI.DisplayFGCOLOR = ini_getlhex("brightness", "DisplayFGCOLOR", DEFAUT_DISPLAY_FGCOLOR, iniPath);
 	configINI.DisplayBGCOLOR = ini_getlhex("brightness", "DisplayBGCOLOR", DEFAUT_DISPLAY_BGCOLOR, iniPath);
 	ini_gets("brightness", "DisplayString", BRIGHTNESS_MESSAGE, configINI.DisplayString, 128, iniPath);
+	brightnessLivel[0] = ini_getl("brightness", "Livel1", 0, iniPath);
+	brightnessLivel[1] = ini_getl("brightness", "Livel2", 0, iniPath);
+	brightnessLivel[2] = ini_getl("brightness", "Livel3", 0, iniPath);
+	brightnessLivel[3] = ini_getl("brightness", "Livel4", 0, iniPath);
+	brightnessLivel[4] = ini_getl("brightness", "Livel5", 0, iniPath);
+	// Fix bad values..
+	int i;
+	for (i = 0; i < 5; i++) {
+		if ((brightnessLivel[i] < 11) || (brightnessLivel[i] > 100)) {
+			brightnessLivel[i] = 0;
+		}
+	}
 }
 
 int getConfig(Config *cfg)
@@ -184,9 +213,27 @@ int setConfig(Config *cfg)
 
 	return 0;
 }
-
+  
 void setConfigPath(const char *argp)
 {
+	#ifdef DEBUG
+		strcpy(debug_msg, argp);
+	#endif
+	// Load config file from internal stored, special for a PSPgo
+	int psp_model = sceKernelGetModel();
+	if (psp_model == PSP_GO) {
+		int dfd;
+		const char *dir = "ef0:/SEPLUGINS/";
+		dfd = sceIoDopen(dir);
+		if (dfd >= 0) {
+			strcpy(configPath, dir);
+			strcpy(configPath + strlen(configPath), BRIGHTNESS_CONFIG_FILE);
+			//
+			strcpy(iniPath, dir);
+			strcpy(iniPath + strlen(iniPath), INI_CONFIG_FILE);
+			return;
+		}
+	}
 	strcpy(configPath, argp);
 	strrchr(configPath, '/')[1] = 0;
 	strcpy(configPath + strlen(configPath), BRIGHTNESS_CONFIG_FILE);
@@ -200,20 +247,7 @@ void showDisplay(){
 	displayTick = 0;
 }
 
-void setDisplay(int state) {
-	u32 k1;
-	k1 = pspSdkSetK1(0);
-	if (state == SCREEN_ON) {
-		sceDisplayEnable();
-		showDisplay();
-	} else if (state == SCREEN_OFF) {
-		sceDisplayDisable();
-	}
-	screenState = state;
-	pspSdkSetK1(k1);
-}
-
-void setbrightnessLivel(void){
+void setImposeLivels(void){	
 	int psp_model = sceKernelGetModel();
 	// PSP_1000 = 0,
 	// PSP_2000 = 1,
@@ -225,15 +259,15 @@ void setbrightnessLivel(void){
 	// PSP_11000 = 10,
 	// per model set values:
 	if ((psp_model == PSP_1000) || (psp_model == PSP_2000)) {
-		brightnessLivel[0] = 36;
-		brightnessLivel[1] = 44;
-		brightnessLivel[2] = 56;
-		brightnessLivel[3] = 68;
+		imposeLivel[0] = 36;
+		imposeLivel[1] = 44;
+		imposeLivel[2] = 56;
+		imposeLivel[3] = 68;
 	} else {
-		brightnessLivel[0] = 44;
-		brightnessLivel[1] = 60;
-		brightnessLivel[2] = 72;
-		brightnessLivel[3] = 84;
+		imposeLivel[0] = 44;
+		imposeLivel[1] = 60;
+		imposeLivel[2] = 72;
+		imposeLivel[3] = 84;
 	}
 }
 
@@ -251,22 +285,22 @@ void setBrightnessImpose(int value){
 	// 3 = 84
 	// 4 = 0 (screen off)
 	// Select the more aprox. value
-	if (value <= brightnessLivel[0]) {
+	if (value <= imposeLivel[0]) {
 		sceImposeSetParam(PSP_IMPOSE_BACKLIGHT_BRIGHTNESS, 0);
-	} else if (value <= brightnessLivel[1]) {
-		if ((value - brightnessLivel[0]) < (brightnessLivel[1]) -  value) {
+	} else if (value <= imposeLivel[1]) {
+		if ((value - imposeLivel[0]) < (imposeLivel[1]) -  value) {
 			sceImposeSetParam(PSP_IMPOSE_BACKLIGHT_BRIGHTNESS, 0);
 		} else {
 			sceImposeSetParam(PSP_IMPOSE_BACKLIGHT_BRIGHTNESS, 1);
 		}	
-	} else if (value <= brightnessLivel[2]) {
-		if ((value - brightnessLivel[1]) < (brightnessLivel[2]) -  value) {
+	} else if (value <= imposeLivel[2]) {
+		if ((value - imposeLivel[1]) < (imposeLivel[2]) -  value) {
 			sceImposeSetParam(PSP_IMPOSE_BACKLIGHT_BRIGHTNESS, 1);
 		} else {
 			sceImposeSetParam(PSP_IMPOSE_BACKLIGHT_BRIGHTNESS, 2);
 		}		
-	} else if (value <= brightnessLivel[3]){
-		if ((value - brightnessLivel[2]) < (brightnessLivel[3]) -  value) {
+	} else if (value <= imposeLivel[3]){
+		if ((value - imposeLivel[2]) < (imposeLivel[3]) -  value) {
 			sceImposeSetParam(PSP_IMPOSE_BACKLIGHT_BRIGHTNESS, 2);
 		} else {
 			sceImposeSetParam(PSP_IMPOSE_BACKLIGHT_BRIGHTNESS, 3);
@@ -298,13 +332,21 @@ int getBrightness(){
 
 void setBrightness(int value){
 	setBrightnessImpose(value);
-	config.brightness = value;
+	if (value >= 11) {
+		config.brightness = value;
+	}
 	u32 k1;
     k1 = pspSdkSetK1(0);
-	sceDisplaySetBrightness(value, 0);
+	#ifdef PATCH_BRIGHTNESS
+		if (_sceDisplaySetBrightness == NULL) {
+			sceDisplaySetBrightness(value, 0);
+		} else {
+			_sceDisplaySetBrightness(value, 0);
+		}
+	#else
+		sceDisplaySetBrightness(value, 0);
+	#endif
     pspSdkSetK1(k1);
-	// Show brightness message
-	showDisplay();
 }
 
 void saveBrightness(void) {
@@ -346,16 +388,103 @@ void changeBrightness(int step, int direction) {
 		// Egone
 	}
 
-	if ((step != 1) && (direction != BRIGHTNESS_NONE)) {
-		if (brightness < 11) brightness = 11;
-	} else {
-		if (brightness < 1) brightness = 1;
-	}
+	if (brightness < 11) brightness = 11;
 	if (brightness > 100) brightness = 100;
-
+	
 	setBrightness(brightness);
-
+		
+	showDisplay();
 }
+
+void displayDisable() {
+	u32 k1;
+	k1 = pspSdkSetK1(0);
+	sceDisplayDisable();
+	pspSdkSetK1(k1);
+	screenState = SCREEN_OFF;
+}
+
+void displayEnable() {
+	u32 k1;
+	k1 = pspSdkSetK1(0);
+	sceDisplayEnable();
+	pspSdkSetK1(k1);
+	screenState = SCREEN_ON;
+}
+
+void setDisplay(int state) {
+	if (state == SCREEN_ON) {
+		setBrightness(config.brightness);
+		displayEnable();
+		if (configINI.StartupMSG) {
+			showDisplay();
+		}
+	} else if (state == SCREEN_OFF) {
+		setBrightness(0);
+		displayDisable();
+	}
+}
+
+#ifdef PATCH_BRIGHTNESS
+void sceDisplaySetBrightness_Patched(int brightness, int unk1)
+{
+	// Dummy function, egnore..
+	#ifdef DEBUG
+		sprintf(debug_msg, "sceDisplaySetBrightness_Patched(%i, %i)", brightness, unk1); 
+	#endif
+}
+typedef struct
+{
+   unsigned int major;
+   unsigned int minor;
+} fw_version;
+void getFwVersion(fw_version *v)
+{
+   long int a = sceKernelDevkitVersion();
+   v->major = (*((char *)&a+3));
+   v->minor = (*((char *)&a+2)*10) + (*((char *)&a+1));
+}
+void PatchBrightness(SceSize args, void *argp)
+{
+	fw_version version;
+	getFwVersion(&version);
+	
+	u32 nidSetBrightness = 0;
+
+	// select appropriate NID
+	if (version.major == 6) {
+		if (version.minor == 61) {
+			nidSetBrightness = 0x60112E07;
+		} else if (version.minor == 60) {
+			nidSetBrightness = 0x60112E07;
+		} else if (version.minor == 39) {
+			nidSetBrightness = 0x89FD2128;
+		} else if (version.minor == 35) {
+			nidSetBrightness = 0x89FD2128;
+		} else if (version.minor == 20) {
+			nidSetBrightness = 0xFF5A5D52;
+		}
+	}
+	
+	u32 text_addr = 0;
+	if (nidSetBrightness > 0) {
+		/* find the Brightness module */
+		text_addr = FindFunc("sceDisplay_Service", "sceDisplay_driver", nidSetBrightness);// 0xFF5A5D52)
+		if (text_addr != 0) {
+			/* patch the Brightness set */
+			PatchSyscall(text_addr, sceDisplaySetBrightness_Patched);
+			/* ok, lets patch it */
+			KERNEL_HIJACK_FUNCTION(text_addr, sceDisplaySetBrightness_Patched, _sceDisplaySetBrightness);
+			// Clear caches
+			ClearCaches();
+		}
+	}
+	#ifdef DEBUG
+		sprintf(debug_msg, "PatchBrightness %i, %i, %i.%i", text_addr, nidSetBrightness, version.major, version.minor);
+	#endif
+	sceKernelExitDeleteThread(0);
+}
+#endif
 
 int main_thread(SceSize args, void *argp)
 {
@@ -374,10 +503,11 @@ int main_thread(SceSize args, void *argp)
 	lastSavedBrightness = config.brightness;
 	// Install system hook
 	install_syscon_hook();
-	sceKernelDelayThread(ONE_SECOND * 2);
+	sceKernelDelayThread(ONE_SECOND);
 	// Show brightness message on start up
-	showDisplay();
-	
+	if (configINI.StartupMSG) {
+		showDisplay();
+	}
 	// Infinite loop
 	while (running)  
 	{
@@ -385,20 +515,27 @@ int main_thread(SceSize args, void *argp)
 		sceKernelDelayThreadCB(ONE_SECOND / 5);
 		
 		// Show display?
+	#ifdef DEBUG
+		while (running) {
+	#else
 		while (displayTick < DISPLAY_MAX_TICK) {
+	#endif
 		
+		#ifdef DEBUG
+			blit_string(1, 1, debug_msg, DEFAUT_DISPLAY_FGCOLOR, DEFAUT_DISPLAY_BGCOLOR);
+		#endif
+
 			if (configINI.DisplayMSG) {
 			
 				char msg[128];
 				sprintf(msg, configINI.DisplayString, getBrightness());
-				blit_string(27, 30, msg, configINI.DisplayFGCOLOR, configINI.DisplayBGCOLOR);
+				blit_string(53, 4, msg, configINI.DisplayFGCOLOR, configINI.DisplayBGCOLOR);
 				// Refresh the display..
 				sceDisplayWaitVblankStart();
 					
 			} else {
 				sceKernelDelayThreadCB(ONE_SECOND / 5);
 			}
-			
 			// To prevent saving contantly the config file..
 			// Only check it, when the display close..
 			saveBrightness();
@@ -413,11 +550,47 @@ int main_thread(SceSize args, void *argp)
 	return 0;
 }
 
+/* Power Callback */
+int power_callback(int unknown, int pwrflags, void *common)
+{
+	if (pwrflags & PSP_POWER_CB_RESUMING) {
+		setDisplay(SCREEN_ON);
+	}
+	return 0;
+}
+
+/* Callback thread */
+int CallbackThread(SceSize args, void *argp)
+{
+    int cbid;
+    cbid = sceKernelCreateCallback("Power Callback", power_callback, NULL);
+    scePowerRegisterCallback(0, cbid);
+    // sceKernelSleepThreadCB();
+	sceKernelExitDeleteThread(0);
+	return 0;
+}
+
+/* Sets up the callback thread and returns its thread id */
+void setupCallBacksAndPatch(void)
+{
+    int thid = sceKernelCreateThread("brightness_callback_thread", CallbackThread, 0x11, 0xFA0, 0, 0);
+    if (thid >= 0) {
+		sceKernelStartThread(thid, 0, 0);
+	}
+	#ifdef PATCH_BRIGHTNESS
+		thid = sceKernelCreateThread("brightness_Patch_thread", PatchBrightness, 0x11, 0xFA0, 0, 0);
+		if (thid >= 0) {
+			sceKernelStartThread(thid, 0, 0);
+		}
+	#endif
+}
+
 int module_start(SceSize args, void *argp)
 {
 	running = 1;
 	setConfigPath(argp);
-	setbrightnessLivel();
+	setImposeLivels();
+	setupCallBacksAndPatch();
 	/* Create a thread */
 	int thid = sceKernelCreateThread("brightness_thread", main_thread, HIGH_PRIORITY_THREAD, 0x1000, 0, NULL); 
 	if (thid > 0) {
@@ -447,39 +620,43 @@ void syscon_ctrl(sceSysconPacket *packet)
 
 		sysconPrevButtons = sysconRawCtrl.Buttons;
 		sysconRawCtrl.Buttons = sysconNewButtons;
+		
+		if (((sysconNewButtons & configINI.ButtonKey) == configINI.ButtonKey) && (!(sysconNewButtons & SYSCON_CTRL_HOLD))) {
 
-		if ((sysconNewButtons & configINI.ButtonKey) == configINI.ButtonKey) {
-
-			if ((sysconNewButtons & configINI.ButtonUP) == configINI.ButtonUP) {
+			if (getBrightness() > 10) { // Screen is ON?
 			
-				changeBrightness(1,  BRIGHTNESS_UP);
-				if (configINI.LockControls) {
-					sysconNewButtons &= ~configINI.ButtonKey;
-					sysconNewButtons &= ~configINI.ButtonUP;
-				}
+				if ((sysconNewButtons & configINI.ButtonUP) == configINI.ButtonUP) {
 				
-			} else if ((sysconNewButtons & configINI.ButtonDN) == configINI.ButtonDN) {
-			
-				changeBrightness(1,  BRIGHTNESS_DOWN);
-				if (configINI.LockControls) {
-					sysconNewButtons &= ~configINI.ButtonKey;
-					sysconNewButtons &= ~configINI.ButtonDN;
-				}
+					changeBrightness(1,  BRIGHTNESS_UP);
+					if (configINI.LockControls) {
+						sysconNewButtons &= ~configINI.ButtonKey;
+						sysconNewButtons &= ~configINI.ButtonUP;
+					}
+					
+				} else if ((sysconNewButtons & configINI.ButtonDN) == configINI.ButtonDN) {
 				
-			} else if ((sysconNewButtons & configINI.ButtonRT) == configINI.ButtonRT) {
-			
-				changeBrightness(10, BRIGHTNESS_UP);
-				if (configINI.LockControls) {
-					sysconNewButtons &= ~configINI.ButtonKey;
-					sysconNewButtons &= ~configINI.ButtonRT;
-				}
+					changeBrightness(1,  BRIGHTNESS_DOWN);
+					if (configINI.LockControls) {
+						sysconNewButtons &= ~configINI.ButtonKey;
+						sysconNewButtons &= ~configINI.ButtonDN;
+					}
+					
+				} else if ((sysconNewButtons & configINI.ButtonRT) == configINI.ButtonRT) {
 				
-			} else if ((sysconNewButtons & configINI.ButtonLT) == configINI.ButtonLT) {
-			
-				changeBrightness(10, BRIGHTNESS_DOWN);
-				if (configINI.LockControls) {
-					sysconNewButtons &= ~configINI.ButtonKey;
-					sysconNewButtons &= ~configINI.ButtonLT;
+					changeBrightness(10, BRIGHTNESS_UP);
+					if (configINI.LockControls) {
+						sysconNewButtons &= ~configINI.ButtonKey;
+						sysconNewButtons &= ~configINI.ButtonRT;
+					}
+					
+				} else if ((sysconNewButtons & configINI.ButtonLT) == configINI.ButtonLT) {
+				
+					changeBrightness(10, BRIGHTNESS_DOWN);
+					if (configINI.LockControls) {
+						sysconNewButtons &= ~configINI.ButtonKey;
+						sysconNewButtons &= ~configINI.ButtonLT;
+					}
+					
 				}
 				
 			}
@@ -499,10 +676,7 @@ void syscon_ctrl(sceSysconPacket *packet)
 		if (sysconUnPressedScreen == 0) {
 			if (sysconNewButtons & SYSCON_CTRL_LCD) {
 				if (!(sysconPrevButtons & SYSCON_CTRL_LCD)) {
-					int brightness = getBrightness();
-					if (brightness >= 11) {
-						sysconUnPressedScreen = 1;
-					}
+					sysconUnPressedScreen = 1;
 				}
 			}
 		} else {
@@ -529,25 +703,52 @@ void syscon_ctrl(sceSysconPacket *packet)
 			if (screenState == SCREEN_OFF) {
 				setDisplay(SCREEN_ON);
 			} else { // Button SCREEN pressed?
+			
 				int brightness = getBrightness();
 				if (brightness > 0) {
-					if (brightness < BRIGHTNESS_EXTRA_LIVEL) { // Extra livel!
-						setBrightness(BRIGHTNESS_EXTRA_LIVEL);
-					} else if (brightness < brightnessLivel[0]) {
-						setBrightness(brightnessLivel[0]);
-					} else if (brightness < brightnessLivel[1]) {
-						setBrightness(brightnessLivel[1]);
-					} else if (brightness < brightnessLivel[2]) {
-						setBrightness(brightnessLivel[2]);
-					} else if (brightness < brightnessLivel[3]) {
-						setBrightness(brightnessLivel[3]);
-					} else {
-						setBrightness(BRIGHTNESS_EXTRA_LIVEL);
+					int bChecked = 0;
+					int i = 0;
+					for (i = 0; i < 5; i++) {
+						if (brightnessLivel[i] > 0) {
+							if (brightness < brightnessLivel[i]) {
+								setBrightness(brightnessLivel[i]);
+								bChecked = 1;
+								break;
+							}
+						}
 					}
+					i = 0;
+					if (bChecked == 0) {
+						for (i = 0; i < 5; i++) {
+							if (brightnessLivel[i] > 0) {
+								setBrightness(brightnessLivel[i]);
+								bChecked = 1;
+								break;
+							}
+						}
+					}
+					
+					if (bChecked == 0) {
+						// Set as standard system livels
+						if (brightness < imposeLivel[0]) {
+							setBrightness(imposeLivel[0]);
+						} else if (brightness < imposeLivel[1]) {
+							setBrightness(imposeLivel[1]);
+						} else if (brightness < imposeLivel[2]) {
+							setBrightness(imposeLivel[2]);
+						} else if (brightness < imposeLivel[3]) {
+							setBrightness(imposeLivel[3]);
+						} else {
+							setBrightness(imposeLivel[0]);
+						}
+					}
+					
+					showDisplay();
+				
 				} else if (config.brightness >= 11) {
 					setDisplay(SCREEN_ON);
-					setBrightness(config.brightness);
 				}
+				
 			}
 		}
 		

@@ -1,9 +1,10 @@
 TARGET 				= brightness
-OBJS 				=  import.o exports.o main.o include/sysconhk.o include/blit.o include/minIni.o
-
+OBJS 				=  import.o \
+					   exports.o main.o \
+					   include/sysconhk.o include/blit.o include/minIni.o include/utils.o
 INCDIR 				= include
 LIBDIR				= lib
-LIBS			 	= -lpspsystemctrl_kernel -lpsprtc -lpsppower_driver
+LIBS			 	= -lpspsystemctrl_kernel -lpsprtc -lpsppower_driver -lgcc
 MININI_DEFINES 		= -DNDEBUG -DINI_READONLY -DINI_FILETYPE=SceUID -DPORTABLE_STRNICMP -DINI_NOFLOAT
 CFLAGS 				= -O2 -G0 -Wall -std=c99 $(MININI_DEFINES) -DKPRINTF_ENABLED
 LDFLAGS 			= -nostdlib -nodefaultlibs
